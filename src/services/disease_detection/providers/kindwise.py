@@ -74,9 +74,11 @@ class KindwiseProvider:
     def _to_result(self, payload: dict) -> DetectionResult | None:
         result = payload.get("result") or {}
 
+        # An independent plant gate, and the only signal in the service that can
+        # overturn a leaf-gate false positive.
         if (result.get("is_plant") or {}).get("binary") is False:
             logger.info("kindwise: not a plant")
-            return None
+            return DetectionResult(None, None, None, self.name, is_plant=False)
 
         suggestions = (result.get("disease") or {}).get("suggestions") or []
         if not suggestions:

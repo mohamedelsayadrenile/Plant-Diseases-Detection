@@ -5,13 +5,14 @@ A small FastAPI service that runs two YOLO models sequentially over an uploaded 
 ```
 Image
   ↓
-Leaf YOLO (yolo11x_leaf.pt)  ── no leaf ──→  {"disease": null, "is_healthy": null}
+Leaf YOLO (yolo11x_leaf.pt)  ── no leaf ──→  {"is_plant": false, ...nulls}
   ↓ leaf detected
 Disease YOLO (PlantDiseaseDetection.pt)     ── conf ≥ YOLO_DISEASE_CONF ──→  {"source": "yolo", ...}
   ↓ below YOLO_DISEASE_CONF, or nothing detected
-Kindwise API                                ── answered ──→  {"source": "kindwise", ...}
+Kindwise API                 ── not a plant ──→  {"is_plant": false, ...nulls}
+  ↓ answered ──→ {"source": "kindwise", ...}
   ↓ unavailable, or also unsure
-{"disease": null, "is_healthy": null}
+{"is_plant": true, "disease": null, "is_healthy": null}
 ```
 
 The leaf model is purely a gate. If it finds no leaf, the disease model never runs. If it passes, the disease model receives the **original uploaded image** — not leaf crops.
@@ -82,10 +83,11 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
   -F "file=@potato_late.jpeg"
 ```
 
-**Response** — always the same four fields, whichever provider answered:
+**Response** — always the same five fields, whichever provider answered:
 
 ```json
 {
+  "is_plant": true,
   "disease": "potato early blight",
   "is_healthy": false,
   "confidence": 0.636,
@@ -93,14 +95,20 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
 }
 ```
 
-| Case | `disease` | `is_healthy` | `confidence` | `source` |
-|---|---|---|---|---|
-| Local model confident | class name | `false` | its score | `"yolo"` |
-| Local model confident, healthy class | `null` | `true` | its score | `"yolo"` |
-| Escalated, Kindwise answered | disease name | `false` | its probability | `"kindwise"` |
-| No leaf detected | `null` | `null` | `null` | `null` |
-| Escalated, Kindwise unavailable or unsure | `null` | `null` | `null` | `null` |
-| Local model unsure, fallback disabled | `null` | `null` | `null` | `null` |
+| Case | `is_plant` | `disease` | `is_healthy` | `confidence` | `source` |
+|---|---|---|---|---|---|
+| Local model confident | `true` | class name | `false` | its score | `"yolo"` |
+| Local model confident, healthy class | `true` | `null` | `true` | its score | `"yolo"` |
+| Escalated, Kindwise answered | `true` | disease name | `false` | its probability | `"kindwise"` |
+| Escalated, Kindwise says not a plant | `false` | `null` | `null` | `null` | `"kindwise"` |
+| No leaf detected | `false` | `null` | `null` | `null` | `null` |
+| Escalated, Kindwise unavailable or unsure | `true` | `null` | `null` | `null` | `null` |
+| Local model unsure, fallback disabled | `true` | `null` | `null` | `null` | `null` |
+
+`is_plant` is the outermost gate: when it is `false`, every other field is `null`. It is `false` in
+exactly two situations — the leaf model found no leaf, or Kindwise's own plant check overruled the
+leaf model. Otherwise it is `true`, meaning the leaf gate passed and nothing contradicted it. Note
+that a `true` backed only by the leaf gate is weak evidence; see the limitations below.
 
 `source` names the provider that produced the answer and `confidence` is that provider's own score,
 so the two are only comparable within a provider. When either model returns several detections, the
@@ -170,8 +178,8 @@ re-encoding is known to change the answer (see limitations below).
 
 ## Known limitations
 
-- **The leaf gate produces false positives.** `yolo11x_leaf.pt` detects a "leaf" in a solid blue image at 0.883 confidence. Raising `LEAF_CONF` does not help at that confidence — it is a limitation of the checkpoint, not the threshold.
-- **`{"disease": null, "is_healthy": null}` is ambiguous.** It covers "no leaf detected", "the fallback was unreachable or also unsure", and "the local model was unsure and the fallback is disabled". The application log distinguishes them.
+- **The leaf gate produces false positives, so `is_plant: true` is weak on its own.** `yolo11x_leaf.pt` detects a "leaf" in a solid blue image at 0.883–0.96 confidence. Raising `LEAF_CONF` does not help at that confidence — it is a limitation of the checkpoint, not the threshold. Kindwise's plant check is the only thing that can overturn it, and it is only consulted when the local disease model is unsure. A confident local detection on a non-plant image will therefore still report `is_plant: true`. In practice the two failures tend to coincide: on that same blue image the disease model returns only a weak `banana leaf` (0.11), which escalates, and Kindwise then correctly returns `is_plant: false`.
+- **`is_plant: true` with everything else null is ambiguous.** It covers "the fallback was unreachable or also unsure" and "the local model was unsure and the fallback is disabled". The application log distinguishes them.
 - **Re-encoding can change the result.** The same photo saved as `.webp` returned `potato late blight` (0.68) where the JPEG returned `potato early blight` (0.64) — lossy compression is enough to reorder two closely scored classes. Kindwise shows the same sensitivity: the same image sent as webp returned `late blight` (0.525) where the JPEG returned `Alternaria brown spot` (0.605). This is why the fallback receives the original upload bytes untouched.
 - The 116-class list contains near-duplicates from two merged training sets (`corn rust` / `Corn rust leaf`, `corn smut` / `Corn Smut`), so the reported class name may vary in capitalization and wording between similar images.
 - **Kindwise names do not match the local class names.** The fallback returns its own vocabulary (`Alternaria brown spot`, `late blight`) with different wording and capitalization from the local model's labels (`potato early blight`). Clients that switch on `disease` must handle both vocabularies — `source` tells them which one they got.

@@ -45,9 +45,11 @@ async def predict(file: UploadFile = File(...)) -> PredictionResponse:
 
     if not has_leaf(image):
         logger.info("no leaf detected in %s", file.filename)
-        return PredictionResponse(disease=None, is_healthy=None)
+        return PredictionResponse(is_plant=False, disease=None, is_healthy=None)
 
     result = await detect_disease(image, raw, MIME_BY_EXTENSION[extension])
     if result is None:
-        return PredictionResponse(disease=None, is_healthy=None)
+        # No provider had an answer, but the leaf gate did pass and nothing
+        # contradicted it, so that stands as the plant verdict.
+        return PredictionResponse(is_plant=True, disease=None, is_healthy=None)
     return PredictionResponse(**asdict(result))
