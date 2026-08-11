@@ -1,10 +1,17 @@
 from PIL import Image
 from ultralytics import YOLO
 
-from src.core import config
+from src.core.config import settings
 from src.core.logging import get_logger
+from src.services.disease_detection.interface import DetectionResult
 
 logger = get_logger(__name__)
+
+# YOLO's own conf floor. Kept far below YOLO_DISEASE_CONF so sub-threshold
+# detections stay visible to the caller and can be escalated to the fallback
+# provider; below this they are noise. Not a tuning knob -- YOLO_DISEASE_CONF is
+# the single threshold that decides what we trust.
+_RAW_CONF_FLOOR = 0.05
 
 # Class IDs whose label means a healthy leaf rather than a disease. Listed
 # explicitly because the names cannot be classified by string rules: several
@@ -22,41 +29,43 @@ HEALTHY_CLASS_IDS = frozenset(
     }
 )
 
-_model: YOLO | None = None
+class YoloProvider:
+    """The local model. Primary provider -- always asked first."""
 
+    name = "yolo"
 
-def load_model() -> None:
-    global _model
-    _model = YOLO(config.DISEASE_MODEL_PATH)
-    _model.to(config.DEVICE)
-    logger.info("disease model loaded from %s", config.DISEASE_MODEL_PATH)
+    def __init__(self) -> None:
+        self._model = YOLO(settings.DISEASE_MODEL_PATH)
+        self._model.to(settings.DEVICE)
+        logger.info("disease model loaded from %s", settings.DISEASE_MODEL_PATH)
 
+    async def detect(
+        self, image: Image.Image, raw: bytes, content_type: str
+    ) -> DetectionResult | None:
+        """Highest-confidence detection, or None if nothing was detected.
 
-def detect_disease(image: Image.Image) -> tuple[str | None, bool | None]:
-    """Return (disease name, is_healthy) for the highest-confidence detection.
+        Detections below YOLO_DISEASE_CONF are returned with their confidence
+        so the caller can escalate; the caller decides what to trust.
+        """
+        result = self._model.predict(
+            source=image,
+            imgsz=settings.IMAGE_SIZE,
+            conf=min(_RAW_CONF_FLOOR, settings.YOLO_DISEASE_CONF),
+            device=settings.DEVICE,
+            save=False,
+            verbose=False,
+        )[0]
 
-    (None, True)  -> a healthy-leaf class was detected
-    (None, None)  -> nothing detected above DISEASE_CONF
-    """
-    result = _model.predict(
-        source=image,
-        imgsz=config.IMAGE_SIZE,
-        conf=config.DISEASE_CONF,
-        device=config.DEVICE,
-        save=False,
-        verbose=False,
-    )[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            logger.info("yolo: no detections above %.2f", _RAW_CONF_FLOOR)
+            return None
 
-    if result.boxes is None or len(result.boxes) == 0:
-        logger.info("disease detection: no detections above %.2f", config.DISEASE_CONF)
-        return None, None
+        best = int(result.boxes.conf.argmax())
+        class_id = int(result.boxes.cls[best])
+        name = result.names[class_id]
+        confidence = float(result.boxes.conf[best])
+        logger.info("yolo: %s (%.2f)", name, confidence)
 
-    best = int(result.boxes.conf.argmax())
-    class_id = int(result.boxes.cls[best])
-    name = result.names[class_id]
-    confidence = float(result.boxes.conf[best])
-    logger.info("disease detection: %s (%.2f)", name, confidence)
-
-    if class_id in HEALTHY_CLASS_IDS:
-        return None, True
-    return name, False
+        if class_id in HEALTHY_CLASS_IDS:
+            return DetectionResult(None, True, confidence, self.name)
+        return DetectionResult(name, False, confidence, self.name)

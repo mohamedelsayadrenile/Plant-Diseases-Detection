@@ -1,4 +1,5 @@
 import io
+from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -15,6 +16,15 @@ router = APIRouter(prefix="/api/v1", tags=["prediction"])
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
+# Derived from the validated extension rather than the client's Content-Type
+# header, which is browser-supplied and often wrong or absent.
+MIME_BY_EXTENSION = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
 
 @router.post("/predict", response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)) -> PredictionResponse:
@@ -25,8 +35,11 @@ async def predict(file: UploadFile = File(...)) -> PredictionResponse:
             detail=f"Unsupported file type. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
         )
 
+    # Kept as uploaded: the fallback provider is sent these bytes untouched,
+    # since re-encoding is known to change the answer (see README).
+    raw = await file.read()
     try:
-        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid or corrupt image file.")
 
@@ -34,5 +47,7 @@ async def predict(file: UploadFile = File(...)) -> PredictionResponse:
         logger.info("no leaf detected in %s", file.filename)
         return PredictionResponse(disease=None, is_healthy=None)
 
-    disease, is_healthy = detect_disease(image)
-    return PredictionResponse(disease=disease, is_healthy=is_healthy)
+    result = await detect_disease(image, raw, MIME_BY_EXTENSION[extension])
+    if result is None:
+        return PredictionResponse(disease=None, is_healthy=None)
+    return PredictionResponse(**asdict(result))

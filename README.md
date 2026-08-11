@@ -1,18 +1,22 @@
 # Plant Disease Detection API
 
-A small FastAPI service that runs two YOLO models sequentially over an uploaded plant image:
+A small FastAPI service that runs two YOLO models sequentially over an uploaded plant image, with a remote API as a fallback second opinion:
 
 ```
 Image
   ↓
 Leaf YOLO (yolo11x_leaf.pt)  ── no leaf ──→  {"disease": null, "is_healthy": null}
   ↓ leaf detected
-Disease YOLO (PlantDiseaseDetection.pt)
-  ↓
-{"disease": "...", "is_healthy": false}
+Disease YOLO (PlantDiseaseDetection.pt)     ── conf ≥ YOLO_DISEASE_CONF ──→  {"source": "yolo", ...}
+  ↓ below YOLO_DISEASE_CONF, or nothing detected
+Kindwise API                                ── answered ──→  {"source": "kindwise", ...}
+  ↓ unavailable, or also unsure
+{"disease": null, "is_healthy": null}
 ```
 
 The leaf model is purely a gate. If it finds no leaf, the disease model never runs. If it passes, the disease model receives the **original uploaded image** — not leaf crops.
+
+The local model is always the primary provider and is always asked first. Kindwise is called only when the local model's best detection is below `YOLO_DISEASE_CONF`, or when it detected nothing at all — so a confident local answer never costs an API call. If Kindwise is unreachable, times out, errors, or has no API key configured, the endpoint logs a warning and returns nulls; it never fails the request, and it never falls back to the low-confidence local answer that triggered the escalation in the first place.
 
 The API returns JSON only. It never returns an annotated or processed image.
 
@@ -41,9 +45,19 @@ All configuration lives in `.env` and is loaded by `src/core/config.py`. Nothing
 | `LEAF_MODEL_PATH` | `./yolo11x_leaf.pt` | Path to the leaf detection checkpoint |
 | `DISEASE_MODEL_PATH` | `./PlantDiseaseDetection.pt` | Path to the disease detection checkpoint |
 | `LEAF_CONF` | `0.15` | Confidence threshold for the leaf gate |
-| `DISEASE_CONF` | `0.25` | Confidence threshold for disease detection |
+| `YOLO_DISEASE_CONF` | `0.35` | Local detections at or above this are trusted; below it the Kindwise fallback is asked instead |
 | `DEVICE` | `cuda:0` | Inference device — `cuda:0`, `cuda:1`, or `cpu` |
 | `IMAGE_SIZE` | `640` | Inference image size (both models were trained at 640) |
+| `KINDWISE_API_URL` | `https://crop.kindwise.com/api/v1` | Base URL of the fallback provider |
+| `KINDWISE_API_KEY` | *(empty)* | Fallback API key. Leave empty to disable the fallback entirely |
+| `KINDWISE_TIMEOUT` | `20.0` | Per-request timeout, in seconds, for the fallback call |
+
+`YOLO_DISEASE_CONF` is an **acceptance** threshold applied in Python, not the `conf=` floor handed to
+YOLO. The model itself runs at a fixed low floor (`_RAW_CONF_FLOOR = 0.05` in
+`src/services/disease_detection/providers/yolo.py`) so that weak detections stay visible and can be
+escalated; without that, anything below the threshold would be discarded inside the model and be
+indistinguishable from "nothing found". The low floor cannot change which detection wins — NMS keeps
+the highest-scoring box of a cluster either way.
 
 ## Running
 
@@ -68,20 +82,29 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
   -F "file=@potato_late.jpeg"
 ```
 
-**Response** — always two fields:
+**Response** — always the same four fields, whichever provider answered:
 
 ```json
-{ "disease": "potato early blight", "is_healthy": false }
+{
+  "disease": "potato early blight",
+  "is_healthy": false,
+  "confidence": 0.636,
+  "source": "yolo"
+}
 ```
 
-| Case | `disease` | `is_healthy` |
-|---|---|---|
-| Disease detected | class name | `false` |
-| Healthy leaf class detected | `null` | `true` |
-| No leaf detected | `null` | `null` |
-| Leaf found, nothing above `DISEASE_CONF` | `null` | `null` |
+| Case | `disease` | `is_healthy` | `confidence` | `source` |
+|---|---|---|---|---|
+| Local model confident | class name | `false` | its score | `"yolo"` |
+| Local model confident, healthy class | `null` | `true` | its score | `"yolo"` |
+| Escalated, Kindwise answered | disease name | `false` | its probability | `"kindwise"` |
+| No leaf detected | `null` | `null` | `null` | `null` |
+| Escalated, Kindwise unavailable or unsure | `null` | `null` | `null` | `null` |
+| Local model unsure, fallback disabled | `null` | `null` | `null` | `null` |
 
-When the disease model returns several detections, the highest-confidence one is reported.
+`source` names the provider that produced the answer and `confidence` is that provider's own score,
+so the two are only comparable within a provider. When either model returns several detections, the
+highest-confidence one is reported.
 
 **Errors** (`400`):
 
@@ -93,12 +116,16 @@ When the disease model returns several detections, the highest-confidence one is
 ### `GET /health`
 
 ```json
-{ "status": "ok", "device": "cuda:0" }
+{ "status": "ok", "device": "cuda:0", "fallback": "kindwise" }
 ```
+
+`fallback` is `"kindwise"` when a `KINDWISE_API_KEY` is configured and `"disabled"` when it is not —
+a missing key logs a warning at startup but never stops the app booting, since the local model is
+the primary provider and works on its own.
 
 ## Healthy vs. disease classes
 
-The disease model has 116 classes, mixing actual diseases with healthy-leaf labels (`tomato leaf`, `apple leaf`, `Corn Healthy`, …). `src/services/disease_detection.py` holds an explicit set of the 33 healthy class IDs.
+The disease model has 116 classes, mixing actual diseases with healthy-leaf labels (`tomato leaf`, `apple leaf`, `Corn Healthy`, …). `src/services/disease_detection/providers/yolo.py` holds an explicit set of the 33 healthy class IDs.
 
 The set is explicit rather than rule-based on purpose. A rule like `name.endswith(" leaf")` would misclassify `Corn rust leaf` (109) and `Tomato blight leaf` (112) as healthy, and a "contains leaf" rule would break another 25 disease labels such as `corn northern leaf blight` and `tomato leaf mold`. Reporting a blight as healthy is this service's worst failure mode, so the IDs are listed one by one.
 
@@ -108,7 +135,7 @@ Three classes name no pathogen but are not healthy either — `Corn Insects Dama
 
 ```
 src/
-├── main.py                       # FastAPI app, model loading at startup, GET /health
+├── main.py                       # FastAPI app, provider lifecycle at startup, GET /health
 ├── core/
 │   ├── config.py                 # .env configuration
 │   └── logging.py                # logger setup
@@ -116,14 +143,39 @@ src/
 │   └── prediction.py             # PredictionResponse
 ├── services/
 │   ├── leaf_detection.py         # load_model(), has_leaf()
-│   └── disease_detection.py      # load_model(), detect_disease(), HEALTHY_CLASS_IDS
+│   └── disease_detection/
+│       ├── interface.py          # DetectionResult, DiseaseProvider
+│       ├── factory.py            # builds the providers, owns the fallback flow
+│       └── providers/
+│           ├── yolo.py           # YoloProvider, HEALTHY_CLASS_IDS
+│           └── kindwise.py       # KindwiseProvider
 └── routes/api/v1/
     └── predict.py                # POST /api/v1/predict
 ```
 
+### Adding or replacing a provider
+
+`interface.py` is the whole contract: a provider is any object with a `name` and an
+`async detect(image, raw, content_type)` returning a `DetectionResult` or `None` (`None` meaning
+"no usable answer from me"). The arguments are the union of what the providers need — the local
+model reads `image`, Kindwise reads `raw` and `content_type` — so each ignores what it does not use.
+
+Escalation policy lives only in `factory.py`; the route holds none of it. Swapping the fallback for a
+different vendor means writing one module under `providers/` and changing the import in
+`factory.py`. A provider must never raise: `KindwiseProvider.detect` catches its own transport and
+parsing failures and returns `None`, which is what keeps a provider outage from breaking the endpoint.
+
+Kindwise is handed the **bytes exactly as uploaded** rather than the decoded `PIL` image, because
+re-encoding is known to change the answer (see limitations below).
+
 ## Known limitations
 
 - **The leaf gate produces false positives.** `yolo11x_leaf.pt` detects a "leaf" in a solid blue image at 0.883 confidence. Raising `LEAF_CONF` does not help at that confidence — it is a limitation of the checkpoint, not the threshold.
-- **`{"disease": null, "is_healthy": null}` is ambiguous.** It covers both "no leaf detected" and "leaf found but no detection above `DISEASE_CONF`". The application log distinguishes the two.
-- **Re-encoding can change the result.** The same photo saved as `.webp` returned `potato late blight` (0.68) where the JPEG returned `potato early blight` (0.64) — lossy compression is enough to reorder two closely scored classes.
+- **`{"disease": null, "is_healthy": null}` is ambiguous.** It covers "no leaf detected", "the fallback was unreachable or also unsure", and "the local model was unsure and the fallback is disabled". The application log distinguishes them.
+- **Re-encoding can change the result.** The same photo saved as `.webp` returned `potato late blight` (0.68) where the JPEG returned `potato early blight` (0.64) — lossy compression is enough to reorder two closely scored classes. Kindwise shows the same sensitivity: the same image sent as webp returned `late blight` (0.525) where the JPEG returned `Alternaria brown spot` (0.605). This is why the fallback receives the original upload bytes untouched.
 - The 116-class list contains near-duplicates from two merged training sets (`corn rust` / `Corn rust leaf`, `corn smut` / `Corn Smut`), so the reported class name may vary in capitalization and wording between similar images.
+- **Kindwise names do not match the local class names.** The fallback returns its own vocabulary (`Alternaria brown spot`, `late blight`) with different wording and capitalization from the local model's labels (`potato early blight`). Clients that switch on `disease` must handle both vocabularies — `source` tells them which one they got.
+- **The fallback is not necessarily more accurate.** On `potato_late.jpeg` the local model reports `potato early blight` (0.64) while Kindwise reports `Alternaria brown spot` (0.605), with `late blight` only second at 0.327. Escalating a weak local detection can replace a correct answer with a confident wrong one; `source` and `confidence` in the response are there to make that measurable on real traffic.
+- **The fallback's `is_healthy: true` path is unverified.** Kindwise returns no health flag — a healthy crop appears as an ordinary suggestion — so `HEALTHY_SUGGESTION_NAMES` in `providers/kindwise.py` matches on name. Until it is confirmed against a genuinely healthy leaf, Kindwise can only report a disease or nulls, never a false "healthy".
+- **No minimum probability is applied to the fallback's answer.** Its top suggestion is returned whatever its probability, with that probability in `confidence`. Adding a floor is one `if` in `KindwiseProvider._to_result`.
+- **Every escalation is a paid API call**, and the service has no upload size limit or rate limit. Junk uploads that get past the leaf gate reach the no-detection path and escalate.
