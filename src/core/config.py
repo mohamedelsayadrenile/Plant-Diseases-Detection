@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     KINDWISE_API_URL: str = "https://crop.kindwise.com/api/v1"
     KINDWISE_API_KEY: str = ""
     KINDWISE_TIMEOUT: float = 20.0
+    # Below this probability the fallback is unsure too and Gemini is asked.
+    KINDWISE_CONF: float = 0.50
+
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
+    # In milliseconds, unlike KINDWISE_TIMEOUT above: the Gemini SDK takes an
+    # int of milliseconds and divides it by 1000 internally.
+    GEMINI_TIMEOUT_MS: int = 20000
 
 
 settings = Settings()

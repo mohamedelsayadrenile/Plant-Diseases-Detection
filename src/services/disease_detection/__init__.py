@@ -1,6 +1,6 @@
 from src.services.disease_detection.factory import (
     detect_disease,
-    fallback_enabled,
+    enabled_providers,
     shutdown,
     startup,
 )
@@ -10,7 +10,7 @@ __all__ = [
     "DetectionResult",
     "DiseaseProvider",
     "detect_disease",
-    "fallback_enabled",
+    "enabled_providers",
     "shutdown",
     "startup",
 ]

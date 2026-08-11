@@ -36,5 +36,5 @@ async def health() -> dict:
     return {
         "status": "ok",
         "device": settings.DEVICE,
-        "fallback": "kindwise" if disease_detection.fallback_enabled() else "disabled",
+        "providers": disease_detection.enabled_providers(),
     }

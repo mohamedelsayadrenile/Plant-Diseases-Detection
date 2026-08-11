@@ -1,6 +1,6 @@
 # Plant Disease Detection API
 
-A small FastAPI service that runs two YOLO models sequentially over an uploaded plant image, with a remote API as a fallback second opinion:
+A small FastAPI service that runs two YOLO models sequentially over an uploaded plant image, escalating to two remote providers when the local model is not confident:
 
 ```
 Image
@@ -9,15 +9,24 @@ Leaf YOLO (yolo11x_leaf.pt)  ── no leaf ──→  {"is_plant": false, ...nu
   ↓ leaf detected
 Disease YOLO (PlantDiseaseDetection.pt)     ── conf ≥ YOLO_DISEASE_CONF ──→  {"source": "yolo", ...}
   ↓ below YOLO_DISEASE_CONF, or nothing detected
-Kindwise API                 ── not a plant ──→  {"is_plant": false, ...nulls}
-  ↓ answered ──→ {"source": "kindwise", ...}
+Kindwise API                 ── not a plant ──→  {"is_plant": false, "source": "kindwise"}
+                             ── prob ≥ KINDWISE_CONF ──→  {"source": "kindwise", ...}
+  ↓ below KINDWISE_CONF, failed, or no answer
+Gemini (gemini-2.5-flash-lite)              ── answered ──→  {"source": "gemini", ...}
   ↓ unavailable, or also unsure
 {"is_plant": true, "disease": null, "is_healthy": null}
 ```
 
 The leaf model is purely a gate. If it finds no leaf, the disease model never runs. If it passes, the disease model receives the **original uploaded image** — not leaf crops.
 
-The local model is always the primary provider and is always asked first. Kindwise is called only when the local model's best detection is below `YOLO_DISEASE_CONF`, or when it detected nothing at all — so a confident local answer never costs an API call. If Kindwise is unreachable, times out, errors, or has no API key configured, the endpoint logs a warning and returns nulls; it never fails the request, and it never falls back to the low-confidence local answer that triggered the escalation in the first place.
+The local model is always the primary provider and is always asked first, so a confident local answer never costs an API call. Each subsequent provider is consulted only when the previous one came back below its threshold or with no answer at all. Two rules hold throughout the chain:
+
+- **A rejected answer is never served.** If an escalation ends in silence, the endpoint returns nulls rather than the low-confidence answer that triggered it.
+- **A provider failure is never a request failure.** Unreachable, timed out, erroring, or unconfigured providers are logged and skipped; the endpoint still returns 200.
+
+Kindwise's "not a plant" verdict is definitive and ends the chain — it is a real answer, not a weak one, so it does not escalate to the paid model.
+
+Each remote provider is enabled by the presence of its API key and skipped silently (with a startup warning) when it is absent, so the service runs with zero, one, or both of them configured.
 
 The API returns JSON only. It never returns an annotated or processed image.
 
@@ -49,9 +58,13 @@ All configuration lives in `.env` and is loaded by `src/core/config.py`. Nothing
 | `YOLO_DISEASE_CONF` | `0.35` | Local detections at or above this are trusted; below it the Kindwise fallback is asked instead |
 | `DEVICE` | `cuda:0` | Inference device — `cuda:0`, `cuda:1`, or `cpu` |
 | `IMAGE_SIZE` | `640` | Inference image size (both models were trained at 640) |
-| `KINDWISE_API_URL` | `https://crop.kindwise.com/api/v1` | Base URL of the fallback provider |
-| `KINDWISE_API_KEY` | *(empty)* | Fallback API key. Leave empty to disable the fallback entirely |
-| `KINDWISE_TIMEOUT` | `20.0` | Per-request timeout, in seconds, for the fallback call |
+| `KINDWISE_API_URL` | `https://crop.kindwise.com/api/v1` | Base URL of the second provider |
+| `KINDWISE_API_KEY` | *(empty)* | Kindwise API key. Leave empty to disable that provider |
+| `KINDWISE_TIMEOUT` | `20.0` | Per-request timeout, in **seconds**, for the Kindwise call |
+| `KINDWISE_CONF` | `0.50` | Kindwise answers at or above this probability are trusted; below it Gemini is asked instead |
+| `GEMINI_API_KEY` | *(empty)* | Gemini API key. Leave empty to disable that provider |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Model id passed to the Gemini API |
+| `GEMINI_TIMEOUT_MS` | `20000` | Per-request timeout, in **milliseconds** — the Gemini SDK takes an int of milliseconds, unlike `KINDWISE_TIMEOUT` above |
 
 `YOLO_DISEASE_CONF` is an **acceptance** threshold applied in Python, not the `conf=` floor handed to
 YOLO. The model itself runs at a fixed low floor (`_RAW_CONF_FLOOR = 0.05` in
@@ -99,11 +112,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
 |---|---|---|---|---|---|
 | Local model confident | `true` | class name | `false` | its score | `"yolo"` |
 | Local model confident, healthy class | `true` | `null` | `true` | its score | `"yolo"` |
-| Escalated, Kindwise answered | `true` | disease name | `false` | its probability | `"kindwise"` |
-| Escalated, Kindwise says not a plant | `false` | `null` | `null` | `null` | `"kindwise"` |
+| Kindwise answered | `true` | disease name | `false` | its probability | `"kindwise"` |
+| Kindwise says not a plant | `false` | `null` | `null` | `null` | `"kindwise"` |
+| Gemini answered | `true` | disease name | `false` | **always `null`** | `"gemini"` |
+| Gemini says healthy | `true` | `null` | `true` | `null` | `"gemini"` |
+| Gemini says not a plant | `false` | `null` | `null` | `null` | `"gemini"` |
 | No leaf detected | `false` | `null` | `null` | `null` | `null` |
-| Escalated, Kindwise unavailable or unsure | `true` | `null` | `null` | `null` | `null` |
-| Local model unsure, fallback disabled | `true` | `null` | `null` | `null` | `null` |
+| Every provider unavailable or unsure | `true` | `null` | `null` | `null` | `null` |
 
 `is_plant` is the outermost gate: when it is `false`, every other field is `null`. It is `false` in
 exactly two situations — the leaf model found no leaf, or Kindwise's own plant check overruled the
@@ -111,8 +126,11 @@ leaf model. Otherwise it is `true`, meaning the leaf gate passed and nothing con
 that a `true` backed only by the leaf gate is weak evidence; see the limitations below.
 
 `source` names the provider that produced the answer and `confidence` is that provider's own score,
-so the two are only comparable within a provider. When either model returns several detections, the
-highest-confidence one is reported.
+so the two are **only comparable within a provider** — YOLO's 0.64 and Kindwise's 0.605 measure
+different things. Gemini reports no confidence at all: an LLM's self-assessment is not a calibrated
+score, and emitting one would make the weakest answer in the chain look like the other two.
+`source: "gemini"` with `confidence: null` is the signal that this answer carries the least
+evidence. When a model returns several detections, the highest-confidence one is reported.
 
 **Errors** (`400`):
 
@@ -124,12 +142,13 @@ highest-confidence one is reported.
 ### `GET /health`
 
 ```json
-{ "status": "ok", "device": "cuda:0", "fallback": "kindwise" }
+{ "status": "ok", "device": "cuda:0", "providers": ["yolo", "kindwise", "gemini"] }
 ```
 
-`fallback` is `"kindwise"` when a `KINDWISE_API_KEY` is configured and `"disabled"` when it is not —
-a missing key logs a warning at startup but never stops the app booting, since the local model is
-the primary provider and works on its own.
+`providers` lists the providers that will actually be tried, in chain order. A remote provider only
+appears when its API key is configured; a missing key logs a warning at startup but never stops the
+app booting, since the local model is primary and works on its own. So a mis-deployed credential is
+visible as a missing entry here.
 
 ## Healthy vs. disease classes
 
@@ -153,10 +172,11 @@ src/
 │   ├── leaf_detection.py         # load_model(), has_leaf()
 │   └── disease_detection/
 │       ├── interface.py          # DetectionResult, DiseaseProvider
-│       ├── factory.py            # builds the providers, owns the fallback flow
+│       ├── factory.py            # builds the providers, owns the chain
 │       └── providers/
 │           ├── yolo.py           # YoloProvider, HEALTHY_CLASS_IDS
-│           └── kindwise.py       # KindwiseProvider
+│           ├── kindwise.py       # KindwiseProvider
+│           └── gemini.py         # GeminiProvider
 └── routes/api/v1/
     └── predict.py                # POST /api/v1/predict
 ```
@@ -168,13 +188,23 @@ src/
 "no usable answer from me"). The arguments are the union of what the providers need — the local
 model reads `image`, Kindwise reads `raw` and `content_type` — so each ignores what it does not use.
 
-Escalation policy lives only in `factory.py`; the route holds none of it. Swapping the fallback for a
-different vendor means writing one module under `providers/` and changing the import in
-`factory.py`. A provider must never raise: `KindwiseProvider.detect` catches its own transport and
-parsing failures and returns `None`, which is what keeps a provider outage from breaking the endpoint.
+Escalation policy lives only in `factory.py`; the route holds none of it, and adding the third
+provider required no change to `interface.py`, `predict.py`, or the response schema. Adding or
+swapping a vendor means writing one module under `providers/` and wiring it into `factory.startup()`
+and the chain.
 
-Kindwise is handed the **bytes exactly as uploaded** rather than the decoded `PIL` image, because
-re-encoding is known to change the answer (see limitations below).
+A provider must never raise. `KindwiseProvider.detect` and `GeminiProvider.detect` each catch their
+own transport and parsing failures and return `None`, which is what keeps a provider outage from
+breaking the endpoint.
+
+Both remote providers are handed the **bytes exactly as uploaded** rather than the decoded `PIL`
+image, because re-encoding is known to change the answer (see limitations below). Every allowed
+extension — jpeg, png, webp — is natively accepted by both APIs, so nothing is ever re-encoded.
+
+Two details of the Gemini SDK are easy to get wrong and are commented at their use sites: its
+timeout is an **int of milliseconds** (not seconds like Kindwise's), and `response.parsed` is
+silently `None` — no exception, no log — when a reply is blocked, empty, or fails schema validation,
+so it is checked explicitly.
 
 ## Known limitations
 
@@ -182,8 +212,10 @@ re-encoding is known to change the answer (see limitations below).
 - **`is_plant: true` with everything else null is ambiguous.** It covers "the fallback was unreachable or also unsure" and "the local model was unsure and the fallback is disabled". The application log distinguishes them.
 - **Re-encoding can change the result.** The same photo saved as `.webp` returned `potato late blight` (0.68) where the JPEG returned `potato early blight` (0.64) — lossy compression is enough to reorder two closely scored classes. Kindwise shows the same sensitivity: the same image sent as webp returned `late blight` (0.525) where the JPEG returned `Alternaria brown spot` (0.605). This is why the fallback receives the original upload bytes untouched.
 - The 116-class list contains near-duplicates from two merged training sets (`corn rust` / `Corn rust leaf`, `corn smut` / `Corn Smut`), so the reported class name may vary in capitalization and wording between similar images.
-- **Kindwise names do not match the local class names.** The fallback returns its own vocabulary (`Alternaria brown spot`, `late blight`) with different wording and capitalization from the local model's labels (`potato early blight`). Clients that switch on `disease` must handle both vocabularies — `source` tells them which one they got.
-- **The fallback is not necessarily more accurate.** On `potato_late.jpeg` the local model reports `potato early blight` (0.64) while Kindwise reports `Alternaria brown spot` (0.605), with `late blight` only second at 0.327. Escalating a weak local detection can replace a correct answer with a confident wrong one; `source` and `confidence` in the response are there to make that measurable on real traffic.
-- **The fallback's `is_healthy: true` path is unverified.** Kindwise returns no health flag — a healthy crop appears as an ordinary suggestion — so `HEALTHY_SUGGESTION_NAMES` in `providers/kindwise.py` matches on name. Until it is confirmed against a genuinely healthy leaf, Kindwise can only report a disease or nulls, never a false "healthy".
-- **No minimum probability is applied to the fallback's answer.** Its top suggestion is returned whatever its probability, with that probability in `confidence`. Adding a floor is one `if` in `KindwiseProvider._to_result`.
-- **Every escalation is a paid API call**, and the service has no upload size limit or rate limit. Junk uploads that get past the leaf gate reach the no-detection path and escalate.
+- **Three providers means three vocabularies.** YOLO returns its 116 class labels (`potato early blight`), Kindwise its own (`Alternaria brown spot`, `late blight`), and Gemini is unconstrained free text, so the same disease can come back worded three ways. Clients that switch on `disease` must key off `source`. Constraining Gemini to the local label space is possible — the 116 class names are recoverable from the checkpoint — if that ever becomes preferable to free-form naming.
+- **A later provider is not necessarily more accurate than an earlier one.** On `potato_late.jpeg` the local model reports `potato early blight` (0.64) while Kindwise reports `Alternaria brown spot` (0.605), with `late blight` only second at 0.327. Escalating a weak detection can replace a correct answer with a confident wrong one; `source` and `confidence` are there to make that measurable on real traffic.
+- **Gemini answers where the specialised models declined to.** It is reached exactly when the evidence is weakest, and it returns no calibrated score, so a confident-sounding disease name arrives with nothing to weigh it against. Treat `source: "gemini"` as the lowest-evidence tier of answer.
+- **Kindwise's `is_healthy: true` path is unverified.** Kindwise returns no health flag — a healthy crop appears as an ordinary suggestion — so `HEALTHY_SUGGESTION_NAMES` in `providers/kindwise.py` matches on name. Until it is confirmed against a genuinely healthy leaf, Kindwise can only report a disease or nulls, never a false "healthy".
+- **`KINDWISE_CONF = 0.50` is calibrated from two observed samples** (0.605 for the jpeg, 0.525 for the same image as webp), both of which only just clear it. A small dip in image quality can flip an answer from "accepted" to "escalated to the paid model", so watch the escalation rate in the logs.
+- **Cost compounds, and nothing bounds it.** A single upload can now bill two paid APIs. The service still has no upload size limit and no rate limit, and Gemini additionally hard-fails above a 20 MB total request — a size an unbounded upload can reach. Junk uploads that get past the leaf gate reach the no-detection path and escalate through the whole chain.
+- **`generate_content` is Google's legacy surface.** The SDK still fully supports it and `gemini-2.5-flash-lite` is GA with no announced shutdown date, but Google is steering new work toward `client.interactions.create` and the Gemini 3.x models, so `providers/gemini.py` will need revisiting.
