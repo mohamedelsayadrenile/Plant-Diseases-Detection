@@ -4,6 +4,7 @@ from ultralytics import YOLO
 from src.core.config import settings
 from src.core.logging import get_logger
 from src.services.disease_detection.interface import DetectionResult
+from src.services.disease_detection.messages import known_classes, message_for
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,21 @@ class YoloProvider:
         self._model = YOLO(settings.DISEASE_MODEL_PATH)
         self._model.to(settings.DEVICE)
         logger.info("disease model loaded from %s", settings.DISEASE_MODEL_PATH)
+        self._check_message_coverage()
+
+    def _check_message_coverage(self) -> None:
+        """Warn if the advice sheet and the checkpoint have drifted apart.
+
+        A class the sheet does not cover would silently serve a null message,
+        which is indistinguishable from a healthy verdict at the API. Checking
+        once at startup turns that into a log line instead of a quiet gap.
+        """
+        model_names = set(self._model.names.values())
+        sheet_names = known_classes()
+        if missing := sorted(model_names - sheet_names):
+            logger.warning("no arabic message for %d class(es): %s", len(missing), missing)
+        if stale := sorted(sheet_names - model_names):
+            logger.warning("arabic sheet has %d unknown class(es): %s", len(stale), stale)
 
     async def detect(
         self, image: Image.Image, raw: bytes, content_type: str
@@ -68,4 +84,4 @@ class YoloProvider:
 
         if class_id in HEALTHY_CLASS_IDS:
             return DetectionResult(None, True, confidence, self.name)
-        return DetectionResult(name, False, confidence, self.name)
+        return DetectionResult(name, False, confidence, self.name, message=message_for(name))

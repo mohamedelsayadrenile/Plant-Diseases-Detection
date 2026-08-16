@@ -96,7 +96,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
   -F "file=@potato_late.jpeg"
 ```
 
-**Response** — always the same five fields, whichever provider answered:
+**Response** — always the same six fields, whichever provider answered:
 
 ```json
 {
@@ -104,21 +104,22 @@ curl -X POST http://127.0.0.1:8000/api/v1/predict \
   "disease": "potato early blight",
   "is_healthy": false,
   "confidence": 0.636,
-  "source": "yolo"
+  "source": "yolo",
+  "message": "اللفحة المبكرة في البطاطس. السبب المحتمل: فطر Alternaria solani …\nالعلاج الموصى به: تسميد متوازن …"
 }
 ```
 
-| Case | `is_plant` | `disease` | `is_healthy` | `confidence` | `source` |
-|---|---|---|---|---|---|
-| Local model confident | `true` | class name | `false` | its score | `"yolo"` |
-| Local model confident, healthy class | `true` | `null` | `true` | its score | `"yolo"` |
-| Kindwise answered | `true` | disease name | `false` | its probability | `"kindwise"` |
-| Kindwise says not a plant | `false` | `null` | `null` | `null` | `"kindwise"` |
-| Gemini answered | `true` | disease name | `false` | **always `null`** | `"gemini"` |
-| Gemini says healthy | `true` | `null` | `true` | `null` | `"gemini"` |
-| Gemini says not a plant | `false` | `null` | `null` | `null` | `"gemini"` |
-| No leaf detected | `false` | `null` | `null` | `null` | `null` |
-| Every provider unavailable or unsure | `true` | `null` | `null` | `null` | `null` |
+| Case | `is_plant` | `disease` | `is_healthy` | `confidence` | `source` | `message` |
+|---|---|---|---|---|---|---|
+| Local model confident | `true` | class name | `false` | its score | `"yolo"` | from the sheet |
+| Local model confident, healthy class | `true` | `null` | `true` | its score | `"yolo"` | `null` |
+| Kindwise answered | `true` | disease name | `false` | its probability | `"kindwise"` | from Gemini |
+| Kindwise says not a plant | `false` | `null` | `null` | `null` | `"kindwise"` | `null` |
+| Gemini answered | `true` | disease name | `false` | **always `null`** | `"gemini"` | from Gemini |
+| Gemini says healthy | `true` | `null` | `true` | `null` | `"gemini"` | `null` |
+| Gemini says not a plant | `false` | `null` | `null` | `null` | `"gemini"` | `null` |
+| No leaf detected | `false` | `null` | `null` | `null` | `null` | `null` |
+| Every provider unavailable or unsure | `true` | `null` | `null` | `null` | `null` | `null` |
 
 `is_plant` is the outermost gate: when it is `false`, every other field is `null`. It is `false` in
 exactly two situations — the leaf model found no leaf, or Kindwise's own plant check overruled the
@@ -131,6 +132,11 @@ different things. Gemini reports no confidence at all: an LLM's self-assessment 
 score, and emitting one would make the weakest answer in the chain look like the other two.
 `source: "gemini"` with `confidence: null` is the signal that this answer carries the least
 evidence. When a model returns several detections, the highest-confidence one is reported.
+
+`message` is Arabic advice for the grower — the likely cause of the disease, then the recommended
+treatment. It is populated **only alongside a named `disease`**: healthy, not-a-plant and
+unresolved answers have no advice to give and leave it `null`. See below for where each provider's
+text comes from.
 
 **Errors** (`400`):
 
@@ -158,6 +164,28 @@ The set is explicit rather than rule-based on purpose. A rule like `name.endswit
 
 Three classes name no pathogen but are not healthy either — `Corn Insects Damages` (99), `Corn Purple Discoloration` (101), `Corn Yellowing` (107). They are deliberately excluded from the healthy set, so they report as the class name with `is_healthy: false`.
 
+## The Arabic `message`
+
+The three providers have three label spaces, so the advice is sourced two different ways.
+
+**The local model answers from a closed set**, so its advice is looked up rather than generated:
+`src/services/disease_detection/data/disease_messages_ar.json` maps every one of the 116 class
+names to its Arabic text. That sheet is the class reference for the local model — every class the
+checkpoint can emit has a key, and the 33 healthy ones map to `null`. Editing the wording is a JSON
+edit, no code change. `YoloProvider` diffs the sheet against `model.names` at startup and logs a
+warning in either direction, so a checkpoint swap that adds a class surfaces as a log line instead
+of a silently null message.
+
+**Kindwise and Gemini answer from open vocabularies**, so nothing can be looked up — Gemini writes
+their text. For a Gemini answer it comes back in the same vision call, as a field on the response
+schema. For a Kindwise answer the factory makes a second, text-only Gemini call
+(`GeminiProvider.describe`) on the name Kindwise returned; it trusts that name rather than
+re-diagnosing it. Both prompts share one spec (`_ADVICE_SPEC`) that pins the format to the sheet's,
+so an answer reads the same to the grower whichever provider produced it.
+
+A missing message is never worth a missing verdict: if Gemini is disabled or the call fails, the
+Kindwise answer is still served, with `message: null`.
+
 ## Project structure
 
 ```
@@ -173,6 +201,9 @@ src/
 │   └── disease_detection/
 │       ├── interface.py          # DetectionResult, DiseaseProvider
 │       ├── factory.py            # builds the providers, owns the chain
+│       ├── messages.py           # loads the Arabic advice sheet
+│       ├── data/
+│       │   └── disease_messages_ar.json   # 116 classes -> Arabic advice
 │       └── providers/
 │           ├── yolo.py           # YoloProvider, HEALTHY_CLASS_IDS
 │           ├── kindwise.py       # KindwiseProvider
@@ -217,5 +248,7 @@ so it is checked explicitly.
 - **Gemini answers where the specialised models declined to.** It is reached exactly when the evidence is weakest, and it returns no calibrated score, so a confident-sounding disease name arrives with nothing to weigh it against. Treat `source: "gemini"` as the lowest-evidence tier of answer.
 - **Kindwise's `is_healthy: true` path is unverified.** Kindwise returns no health flag — a healthy crop appears as an ordinary suggestion — so `HEALTHY_SUGGESTION_NAMES` in `providers/kindwise.py` matches on name. Until it is confirmed against a genuinely healthy leaf, Kindwise can only report a disease or nulls, never a false "healthy".
 - **`KINDWISE_CONF = 0.50` is calibrated from two observed samples** (0.605 for the jpeg, 0.525 for the same image as webp), both of which only just clear it. A small dip in image quality can flip an answer from "accepted" to "escalated to the paid model", so watch the escalation rate in the logs.
-- **Cost compounds, and nothing bounds it.** A single upload can now bill two paid APIs. The service still has no upload size limit and no rate limit, and Gemini additionally hard-fails above a 20 MB total request — a size an unbounded upload can reach. Junk uploads that get past the leaf gate reach the no-detection path and escalate through the whole chain.
+- **Cost compounds, and nothing bounds it.** A single upload can now bill two paid APIs, and a Kindwise-served answer bills Gemini too for its `message`. The service still has no upload size limit and no rate limit, and Gemini additionally hard-fails above a 20 MB total request — a size an unbounded upload can reach. Junk uploads that get past the leaf gate reach the no-detection path and escalate through the whole chain.
+- **A Kindwise answer costs an extra Gemini round trip.** `describe` is a second serial call after Kindwise returns, so that branch's latency is Kindwise plus Gemini rather than Kindwise alone. It is only paid on the Kindwise-served path — the local model looks its advice up for free, and Gemini writes its own in the call it was already making.
+- **Only the local model's advice is reviewed text.** The sheet is fixed and auditable; the Kindwise and Gemini messages are generated per request, so their wording — and the active ingredients they name — varies between calls and is not reviewed before it reaches the grower.
 - **`generate_content` is Google's legacy surface.** The SDK still fully supports it and `gemini-2.5-flash-lite` is GA with no announced shutdown date, but Google is steering new work toward `client.interactions.create` and the Gemini 3.x models, so `providers/gemini.py` will need revisiting.

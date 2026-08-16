@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from PIL import Image
 
 from src.core.config import settings
@@ -61,6 +63,22 @@ def _confident(result: DetectionResult | None, threshold: float) -> bool:
     )
 
 
+async def _with_message(result: DetectionResult) -> DetectionResult:
+    """Attach Gemini's Arabic advice to an answer that came from Kindwise.
+
+    Kindwise names diseases from its own open taxonomy, so its answers cannot be
+    looked up in the local advice sheet the way the local model's fixed classes
+    are -- Gemini writes the text instead.
+
+    A missing message is never worth a missing verdict: if Gemini is disabled or
+    the call fails, the Kindwise answer is returned unchanged with message None.
+    """
+    if result.disease is None or _gemini is None:
+        return result
+    message = await _gemini.describe(result.disease)
+    return replace(result, message=message)
+
+
 def _describe(result: DetectionResult | None) -> str:
     if result is None:
         return "no answer"
@@ -90,7 +108,7 @@ async def detect_disease(
         if result is not None and not result.is_plant:
             return result
         if _confident(result, settings.KINDWISE_CONF):
-            return result
+            return await _with_message(result)
         previous = "kindwise"
 
     if _gemini is not None:

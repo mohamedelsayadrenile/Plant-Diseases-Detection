@@ -17,6 +17,13 @@ class DetectionResult:
     # implicitly answered it; only Kindwise reports on this independently, and
     # only it can overturn the leaf gate by returning False.
     is_plant: bool = True
+    # Arabic advice for the grower: the likely cause of the disease followed by
+    # the recommended treatment. Only ever set alongside a named disease --
+    # healthy and not-a-plant verdicts have no advice to give, so they leave it
+    # None. Where the text comes from depends on the provider: `yolo` looks it
+    # up in the local advice sheet (see messages.py), the two remote providers
+    # have open label spaces and get theirs written by Gemini.
+    message: str | None = None
 
 
 class DiseaseProvider(Protocol):
